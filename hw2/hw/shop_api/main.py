@@ -1,46 +1,104 @@
-from fastapi import FastAPI, HTTPException, Query, Response
+import os
+
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from pydantic import BaseModel
 from prometheus_fastapi_instrumentator import Instrumentator
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, String, create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
+engine = create_engine(os.getenv("DATABASE_URL", "sqlite:///shop.db"))
+
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+class ItemModel(Base):
+    __tablename__ = "items"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    price = Column(Float)
+    deleted = Column(Boolean, default=False)
+
+
+class CartModel(Base):
+    __tablename__ = "carts"
+
+    id = Column(Integer, primary_key=True)
+
+
+class CartItemModel(Base):
+    __tablename__ = "cart_items"
+
+    cart_id = Column(Integer, ForeignKey("carts.id"), primary_key=True)
+    item_id = Column(Integer, ForeignKey("items.id"), primary_key=True)
+    quantity = Column(Integer)
+
+
+Base.metadata.create_all(engine)
 
 app = FastAPI(title="Shop API")
 Instrumentator().instrument(app).expose(app)
-items = {}
-carts = {}
+
 
 class Item(BaseModel):
     name: str
     price: float
 
-def create(cid):
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def create(db, cid):
+    cart = db.get(CartModel, cid)
+    if cart is None:
+        raise HTTPException(404, "cart not found")
+
     cart_items = []
     price = 0.0
-    for id, qty in carts[cid].items():
-        item = items[id]
+    for link in db.query(CartItemModel).filter_by(cart_id=cid).all():
+        item = db.get(ItemModel, link.item_id)
         cart_items.append({
-            "id": id,  "name": item["name"],
-            "quantity": qty,
-            "available": item["deleted"] == False
+            "id": link.item_id, "name": item.name,
+            "quantity": link.quantity,
+            "available": item.deleted == False
         })
 
-        price += item["price"] * qty
+        price += item.price * link.quantity
 
     return {
-        "id": cid, 
-        "items": cart_items, 
+        "id": cid,
+        "items": cart_items,
         "price": price
-            }
+    }
+
+
+def dump_item(item):
+    return {
+        "id": item.id,
+        "name": item.name,
+        "price": item.price,
+        "deleted": item.deleted,
+    }
 
 
 @app.post("/cart", status_code=201)
-def post_cart(response: Response):
-    new_id = len(carts) + 1
-    carts[new_id] = {}
-    response.headers["location"] = f"/cart/{new_id}"
-    return {"id": new_id}
+def post_cart(response: Response, db=Depends(get_db)):
+    cart = CartModel()
+    db.add(cart)
+    db.commit()
+    response.headers["location"] = f"/cart/{cart.id}"
+    return {"id": cart.id}
+
 
 @app.get("/cart/{id}")
-def get_cart(id: int):
-    return create(id)
+def get_cart(id: int, db=Depends(get_db)):
+    return create(db, id)
 
 
 @app.get("/cart")
@@ -51,11 +109,13 @@ def get_carts(
     max_price: float | None = Query(None, ge=0),
     min_quantity: int | None = Query(None, ge=0),
     max_quantity: int | None = Query(None, ge=0),
+    db=Depends(get_db),
 ):
     result = []
 
-    for cid in carts:
-        cart = create(cid)
+    for cart in db.query(CartModel).order_by(CartModel.id).all():
+        cid = cart.id
+        cart = create(db, cid)
         quantity = 0
         for item in cart["items"]:
             quantity += item["quantity"]
@@ -78,31 +138,30 @@ def get_carts(
 
 
 @app.post("/cart/{cart_id}/add/{item_id}")
-def add_to_cart(cart_id: int, item_id: int):
-    if item_id in carts[cart_id]:
-        carts[cart_id][item_id] += 1
+def add_to_cart(cart_id: int, item_id: int, db=Depends(get_db)):
+    link = db.get(CartItemModel, (cart_id, item_id))
+    if link is not None:
+        link.quantity += 1
     else:
-        carts[cart_id][item_id] = 1
-    return create(cart_id)
+        db.add(CartItemModel(cart_id=cart_id, item_id=item_id, quantity=1))
+    db.commit()
+    return create(db, cart_id)
+
 
 @app.post("/item", status_code=201)
-def post_item(body: Item):
-    new_id = len(items) + 1
-    item = {
-        "id": new_id,
-        "name": body.name,
-        "price": body.price,
-        "deleted": False
-    }
-    items[new_id] = item
-    return item
+def post_item(body: Item, db=Depends(get_db)):
+    item = ItemModel(name=body.name, price=body.price, deleted=False)
+    db.add(item)
+    db.commit()
+    return dump_item(item)
+
 
 @app.get("/item/{id}")
-def get_item(id: int):
-    item = items[id]
-    if item["deleted"]:
+def get_item(id: int, db=Depends(get_db)):
+    item = db.get(ItemModel, id)
+    if item is None or item.deleted:
         raise HTTPException(404, "item not found")
-    return item
+    return dump_item(item)
 
 
 @app.get("/item")
@@ -112,9 +171,11 @@ def get_items(
     min_price: float | None = Query(None, ge=0),
     max_price: float | None = Query(None, ge=0),
     show_deleted: bool = False,
+    db=Depends(get_db),
 ):
     result = []
-    for item in items.values():
+    for item in db.query(ItemModel).order_by(ItemModel.id).all():
+        item = dump_item(item)
         if item["deleted"] == True and show_deleted == False:
             continue
         if min_price is not None and item["price"] < min_price:
@@ -127,35 +188,39 @@ def get_items(
 
 
 @app.put("/item/{id}")
-def put_item(id: int, body: Item):
-    item = items.get(id)
+def put_item(id: int, body: Item, db=Depends(get_db)):
+    item = db.get(ItemModel, id)
     if item is None:
         raise HTTPException(404, "not found")
 
-    item["name"] = body.name
-    item["price"] = body.price
-    return item
+    item.name = body.name
+    item.price = body.price
+    db.commit()
+    return dump_item(item)
 
 
 @app.patch("/item/{id}")
-def patch_item(id: int, body: dict):
-    item = items[id]
+def patch_item(id: int, body: dict, db=Depends(get_db)):
+    item = db.get(ItemModel, id)
 
     for key in body.keys():
         if key not in ["name", "price"]:
             raise HTTPException(422, "unknown field")
 
-    if item["deleted"]:
+    if item.deleted:
         raise HTTPException(304)
 
     if "name" in body:
-        item["name"] = body["name"]
+        item.name = body["name"]
     if "price" in body:
-        item["price"] = body["price"]
-    return item
+        item.price = body["price"]
+    db.commit()
+    return dump_item(item)
 
 
 @app.delete("/item/{id}")
-def delete_item(id: int):
-    items[id]["deleted"] = True
-    return items[id]
+def delete_item(id: int, db=Depends(get_db)):
+    item = db.get(ItemModel, id)
+    item.deleted = True
+    db.commit()
+    return dump_item(item)

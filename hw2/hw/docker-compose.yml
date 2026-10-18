@@ -1,8 +1,21 @@
 services:
 
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+    ports:
+      - "5432:5432"
+
   local:
     build: .
     restart: always
+    environment:
+      DATABASE_URL: postgresql+psycopg2://shop:shop@postgres:5432/shop
+    depends_on:
+      - postgres
     ports:
       - 8080:8080
 
